@@ -10,7 +10,6 @@ This project is created because my laptop Extreme Cooling was not working correc
 This project has:
 - `auto_ec.py`: background script that toggles Lenovo Extreme Cooling based on CPU temperature.
 - `lenovo-ec.service`: systemd service to run `auto_ec.py` at boot.
-- `ec_tray.py`: optional tray indicator app for desktop sessions.
 
 ## 1) Install `auto_ec.py`
 
@@ -35,46 +34,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now lenovo-ec.service
 ```
 
-## 3) Install `ec_tray.py` and autostart it
-
-`ec_tray.py` needs `PyQt6`. Install it first:
-
-```bash
-python3 -m pip install --user PyQt6
-```
-
-You can place `ec_tray.py` anywhere you want (for example `~/Apps/ec_tray.py`), then make it executable:
-
-```bash
-chmod 755 /path/to/ec_tray.py
-```
-
-To autostart in most desktop environments, create a desktop entry:
-
-```bash
-mkdir -p ~/.config/autostart
-```
-
-Create `~/.config/autostart/ec_tray.desktop`:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=Extreme Cooling Tray
-Exec=/path/to/ec_tray.py
-Terminal=false
-X-GNOME-Autostart-enabled=true
-```
-
-Replace `/path/to/ec_tray.py` with your real path.
-
-## Desktop environment and compatibility notes
+## Compatibility notes
 
 - `auto_ec.py` reads temperatures from `k10temp`, so it is mainly compatible with systems exposing that sensor name (commonly AMD). On systems with different sensor names, it may not detect CPU temperature.
 - `auto_ec.py` writes to `/dev/port`, so it needs root privileges (handled by the systemd service when started by systemd as root).
-- `ec_tray.py` depends on `PyQt6` and `QSystemTrayIcon`. Some desktop environments (especially GNOME defaults without AppIndicator extensions) may not show tray icons correctly.
-- On Wayland sessions, tray icon behavior depends on compositor and desktop support; X11 sessions are usually more consistent for legacy tray indicators.
-- Icon themes may vary, so `temperature-cold` / `temperature-warm` theme icons might not exist in all themes.
 
 ## License
 

@@ -25,16 +25,16 @@ INTERVAL = 5
 def get_cpu_temp_path():
     for path in glob.glob("/sys/class/hwmon/hwmon*/name"):
         try:
-            with open(path, 'r') as f:
+            with open(path, "r") as f:
                 if "k10temp" in f.read():
                     return path.replace("name", "temp1_input")
-        except: continue
+        except OSError:
+            continue
     return None
 
 def ec_wait(fd, flag, value):
     for _ in range(100):
-        os.lseek(fd, EC_SC, os.SEEK_SET)
-        status = ord(os.read(fd, 1))
+        status = os.pread(fd, 1, EC_SC)[0]
         if ((status >> flag) & 0x1) == value:
             return True
         time.sleep(0.001)
@@ -43,39 +43,38 @@ def ec_wait(fd, flag, value):
 # Writes to the EC register without portio
 def ec_write(fd, port, value):
     if ec_wait(fd, IBF, 0):
-        os.lseek(fd, EC_SC, os.SEEK_SET)
-        os.write(fd, bytes([WR_EC]))
+        os.pwrite(fd, bytes([WR_EC]), EC_SC)
     if ec_wait(fd, IBF, 0):
-        os.lseek(fd, EC_DATA, os.SEEK_SET)
-        os.write(fd, bytes([port]))
+        os.pwrite(fd, bytes([port]), EC_DATA)
     if ec_wait(fd, IBF, 0):
-        os.lseek(fd, EC_DATA, os.SEEK_SET)
-        os.write(fd, bytes([value]))
+        os.pwrite(fd, bytes([value]), EC_DATA)
 
 def main():
     temp_path = get_cpu_temp_path()
-    if not temp_path: return
+    if not temp_path:
+        return
 
-    with open("/dev/port", "rb+", buffering=0) as f:
-        fd = f.fileno()
+    port_fd = os.open("/dev/port", os.O_RDWR)
+    temp_fd = os.open(temp_path, os.O_RDONLY)
+    try:
         is_active = False
-        
         while True:
             try:
-                with open(temp_path, "r") as tf:
-                    temp = int(tf.read()) / 1000
-            except: temp = 0
+                temp = int(os.pread(temp_fd, 16, 0)) / 1000
+            except (OSError, ValueError):
+                temp = 0
 
             if temp >= TEMP_ON and not is_active:
-                ec_write(fd, EXTREME_COOLING_REGISTER, ACTIVATE)
+                ec_write(port_fd, EXTREME_COOLING_REGISTER, ACTIVATE)
                 is_active = True
             elif temp <= TEMP_OFF and is_active:
-                ec_write(fd, EXTREME_COOLING_REGISTER, DEACTIVATE)
+                ec_write(port_fd, EXTREME_COOLING_REGISTER, DEACTIVATE)
                 is_active = False
-            
-            with open("/tmp/ec_fan_status", "w") as sf:
-                sf.write("ON" if is_active else "OFF")
+
             time.sleep(INTERVAL)
+    finally:
+        os.close(temp_fd)
+        os.close(port_fd)
 
 if __name__ == "__main__":
     main()
