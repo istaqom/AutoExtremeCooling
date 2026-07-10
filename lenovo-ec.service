@@ -4,7 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/auto_ec.py
+ExecStart=/usr/bin/python3 /usr/local/bin/auto_ec.py --temp-on 70 --temp-off 60 --interval 5
 Restart=always
 
 [Install]
