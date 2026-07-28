@@ -49,7 +49,15 @@ def get_cpu_temp_path():
 
 def ec_wait(fd, bit, value):
     for _ in range(100):
-        status = os.pread(fd, 1, EC_SC)[0]
+        try:
+            buf = os.pread(fd, 1, EC_SC)
+            if not buf:
+                time.sleep(0.001)
+                continue
+            status = buf[0]
+        except OSError:
+            time.sleep(0.001)
+            continue
         if ((status >> bit) & 0x1) == value:
             return True
         time.sleep(0.001)
@@ -125,7 +133,7 @@ def main():
         log("CPU temperature sensor (k10temp) not found")
         sys.exit(1)
 
-    if not os.access("/dev/port", os.RDWR):
+    if not os.access("/dev/port", os.R_OK | os.W_OK):
         log("No read/write access to /dev/port — run as root")
         sys.exit(1)
 
@@ -141,23 +149,29 @@ def main():
         _is_active = False
         while not _shutdown:
             try:
-                temp = int(os.pread(_temp_fd, 16, 0)) / 1000
-            except (OSError, ValueError):
+                raw = os.pread(_temp_fd, 16, 0)
+                if isinstance(raw, bytes):
+                    raw = raw.decode("ascii", errors="ignore").strip()
+                temp = int(raw) / 1000
+            except (OSError, ValueError, AttributeError):
                 temp = 0
                 log(f"Failed to read temperature from {temp_path}")
 
-            if temp >= args.temp_on and not _is_active:
-                if ec_write(_port_fd, EXTREME_COOLING_REGISTER, ACTIVATE):
-                    _is_active = True
-                    log(f"Extreme Cooling ON (temp={temp}°C)")
-                else:
-                    log("EC write timeout — failed to activate Extreme Cooling")
-            elif temp <= args.temp_off and _is_active:
-                if ec_write(_port_fd, EXTREME_COOLING_REGISTER, DEACTIVATE):
-                    _is_active = False
-                    log(f"Extreme Cooling OFF (temp={temp}°C)")
-                else:
-                    log("EC write timeout — failed to deactivate Extreme Cooling")
+            try:
+                if temp >= args.temp_on and not _is_active:
+                    if ec_write(_port_fd, EXTREME_COOLING_REGISTER, ACTIVATE):
+                        _is_active = True
+                        log(f"Extreme Cooling ON (temp={temp}°C)")
+                    else:
+                        log("EC write timeout — failed to activate Extreme Cooling")
+                elif temp <= args.temp_off and _is_active:
+                    if ec_write(_port_fd, EXTREME_COOLING_REGISTER, DEACTIVATE):
+                        _is_active = False
+                        log(f"Extreme Cooling OFF (temp={temp}°C)")
+                    else:
+                        log("EC write timeout — failed to deactivate Extreme Cooling")
+            except (OSError, IndexError) as e:
+                log(f"EC communication error: {e}")
 
             time.sleep(args.interval)
     finally:
