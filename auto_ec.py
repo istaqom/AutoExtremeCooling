@@ -15,11 +15,19 @@ OBF = 0   # Output Buffer Full bit in EC status register
 RD_EC = 0x80
 WR_EC = 0x81
 EXTREME_COOLING_REGISTER = 0xBD
-ACTIVATE = 0x40
-DEACTIVATE = 0x00
+MODE_OFF = 0x00
+MODE_NORMAL = 0x80
+MODE_EXTREME = 0x40
+MODE_NAMES = {
+    MODE_OFF: "OFF",
+    MODE_NORMAL: "NORMAL",
+    MODE_EXTREME: "EXTREME",
+}
 
 DEFAULT_TEMP_ON = 70
 DEFAULT_TEMP_OFF = 60
+DEFAULT_TEMP_NORMAL_ON = 50
+DEFAULT_TEMP_NORMAL_OFF = 40
 DEFAULT_INTERVAL = 5
 
 PID_FILE = "/run/auto_ec.pid"
@@ -28,7 +36,7 @@ PID_FILE = "/run/auto_ec.pid"
 _port_fd = None
 _temp_fd = None
 _shutdown = False
-_is_active = False
+_mode = MODE_OFF
 
 
 def log(msg):
@@ -77,6 +85,16 @@ def ec_write(fd, port, value):
     return True
 
 
+def set_mode(fd, mode, temp):
+    global _mode
+    if not ec_write(fd, EXTREME_COOLING_REGISTER, mode):
+        log(f"EC write timeout — failed to set {MODE_NAMES[mode]}")
+        return False
+    _mode = mode
+    log(f"Fan {MODE_NAMES[mode]} (temp={temp}°C)")
+    return True
+
+
 def cleanup_pid():
     try:
         os.remove(PID_FILE)
@@ -109,13 +127,17 @@ def write_pid():
 
 
 def main():
-    global _port_fd, _temp_fd, _is_active
+    global _port_fd, _temp_fd, _mode
 
     parser = argparse.ArgumentParser(description="Lenovo Extreme Cooling Automation")
     parser.add_argument("--temp-on", type=int, default=DEFAULT_TEMP_ON,
-                        help=f"Temperature threshold to activate (default: {DEFAULT_TEMP_ON})")
+                        help=f"Temperature threshold to activate extreme cooling (default: {DEFAULT_TEMP_ON})")
     parser.add_argument("--temp-off", type=int, default=DEFAULT_TEMP_OFF,
-                        help=f"Temperature threshold to deactivate (default: {DEFAULT_TEMP_OFF})")
+                        help=f"Temperature threshold to leave extreme cooling (default: {DEFAULT_TEMP_OFF})")
+    parser.add_argument("--temp-normal-on", type=int, default=DEFAULT_TEMP_NORMAL_ON,
+                        help=f"Temperature threshold to activate normal fan (default: {DEFAULT_TEMP_NORMAL_ON})")
+    parser.add_argument("--temp-normal-off", type=int, default=DEFAULT_TEMP_NORMAL_OFF,
+                        help=f"Temperature threshold to turn fans off (default: {DEFAULT_TEMP_NORMAL_OFF})")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
                         help=f"Temperature check interval in seconds (default: {DEFAULT_INTERVAL})")
     args = parser.parse_args()
@@ -124,6 +146,12 @@ def main():
     # when temperature fluctuates around the threshold.
     if args.temp_off >= args.temp_on:
         log("--temp-off must be less than --temp-on")
+        sys.exit(1)
+    if args.temp_normal_off >= args.temp_normal_on:
+        log("--temp-normal-off must be less than --temp-normal-on")
+        sys.exit(1)
+    if args.temp_normal_on >= args.temp_on:
+        log("--temp-normal-on must be less than --temp-on")
         sys.exit(1)
 
     write_pid()
@@ -143,10 +171,12 @@ def main():
     _port_fd = os.open("/dev/port", os.O_RDWR)
     _temp_fd = os.open(temp_path, os.O_RDONLY)
 
-    log(f"Started: temp_on={args.temp_on}°C temp_off={args.temp_off}°C interval={args.interval}s")
+    log(f"Started: extreme={args.temp_on}/{args.temp_off}°C "
+        f"normal={args.temp_normal_on}/{args.temp_normal_off}°C "
+        f"interval={args.interval}s")
 
     try:
-        _is_active = False
+        _mode = MODE_OFF
         while not _shutdown:
             try:
                 raw = os.pread(_temp_fd, 16, 0)
@@ -158,30 +188,27 @@ def main():
                 log(f"Failed to read temperature from {temp_path}")
 
             try:
-                if temp >= args.temp_on and not _is_active:
-                    if ec_write(_port_fd, EXTREME_COOLING_REGISTER, ACTIVATE):
-                        _is_active = True
-                        log(f"Extreme Cooling ON (temp={temp}°C)")
-                    else:
-                        log("EC write timeout — failed to activate Extreme Cooling")
-                elif temp <= args.temp_off and _is_active:
-                    if ec_write(_port_fd, EXTREME_COOLING_REGISTER, DEACTIVATE):
-                        _is_active = False
-                        log(f"Extreme Cooling OFF (temp={temp}°C)")
-                    else:
-                        log("EC write timeout — failed to deactivate Extreme Cooling")
+                if temp >= args.temp_on and _mode != MODE_EXTREME:
+                    set_mode(_port_fd, MODE_EXTREME, temp)
+                elif _mode == MODE_EXTREME and temp <= args.temp_off:
+                    next_mode = MODE_NORMAL if temp >= args.temp_normal_on else MODE_OFF
+                    set_mode(_port_fd, next_mode, temp)
+                elif temp >= args.temp_normal_on and _mode == MODE_OFF:
+                    set_mode(_port_fd, MODE_NORMAL, temp)
+                elif temp <= args.temp_normal_off and _mode == MODE_NORMAL:
+                    set_mode(_port_fd, MODE_OFF, temp)
             except (OSError, IndexError) as e:
                 log(f"EC communication error: {e}")
 
             time.sleep(args.interval)
     finally:
-        if _is_active:
-            log("Deactivating Extreme Cooling before exit...")
-            if ec_write(_port_fd, EXTREME_COOLING_REGISTER, DEACTIVATE):
-                _is_active = False
-                log("Extreme Cooling deactivated")
+        if _mode != MODE_OFF:
+            log("Deactivating fans before exit...")
+            if ec_write(_port_fd, EXTREME_COOLING_REGISTER, MODE_OFF):
+                _mode = MODE_OFF
+                log("Fans deactivated")
             else:
-                log("EC write timeout — Extreme Cooling may still be active")
+                log("EC write timeout — fans may still be active")
         os.close(_temp_fd)
         os.close(_port_fd)
         log("Stopped")
