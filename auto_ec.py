@@ -1,18 +1,19 @@
 #!/usr/bin/python3
 import argparse
-import atexit
-import os
+from contextlib import contextmanager, ExitStack
+import fcntl
 import glob
+import os
+import select
 import signal
 import sys
+import threading
 import time
 
 # EC address constants (from Alberto Vicente/ExtremeCooling4Linux)
 EC_SC = 0x66
 EC_DATA = 0x62
 IBF = 1   # Input Buffer Full bit in EC status register
-OBF = 0   # Output Buffer Full bit in EC status register
-RD_EC = 0x80
 WR_EC = 0x81
 EXTREME_COOLING_REGISTER = 0xBD
 MODE_OFF = 0x00
@@ -31,12 +32,9 @@ DEFAULT_TEMP_NORMAL_OFF = 40
 DEFAULT_INTERVAL = 5
 
 PID_FILE = "/run/auto_ec.pid"
-
-# Module-level state for signal handler access
-_port_fd = None
-_temp_fd = None
-_shutdown = False
-_mode = MODE_OFF
+EC_TIMEOUT = 0.1
+EC_POLL_INTERVAL = 0.001
+FAIL_LOG_INTERVAL = 60
 
 
 def log(msg):
@@ -45,90 +43,118 @@ def log(msg):
 
 
 def get_cpu_temp_path():
-    for path in glob.glob("/sys/class/hwmon/hwmon*/name"):
+    for path in sorted(glob.glob("/sys/class/hwmon/hwmon*/name")):
         try:
             with open(path, "r") as f:
-                if "k10temp" in f.read():
-                    return path.replace("name", "temp1_input")
+                if f.read().strip() != "k10temp":
+                    continue
+            temp_path = os.path.join(os.path.dirname(path), "temp1_input")
+            if os.path.isfile(temp_path):
+                return temp_path
         except OSError:
             continue
     return None
 
 
-def ec_wait(fd, bit, value):
-    for _ in range(100):
+class TemperatureSensor:
+    def __init__(self):
+        self.path = get_cpu_temp_path()
+
+    def read(self):
+        if self.path is None:
+            self.path = get_cpu_temp_path()
+        if self.path is None:
+            raise OSError("CPU temperature sensor (k10temp) not found")
         try:
-            buf = os.pread(fd, 1, EC_SC)
-            if not buf:
-                time.sleep(0.001)
-                continue
-            status = buf[0]
-        except OSError:
-            time.sleep(0.001)
-            continue
-        if ((status >> bit) & 0x1) == value:
-            return True
-        time.sleep(0.001)
-    return False
+            # Reopen sysfs each time so a stale descriptor cannot survive resume.
+            with open(self.path, "rb") as f:
+                return int(f.read()) / 1000
+        except (OSError, ValueError):
+            # hwmon numbering can change when a sensor disappears/reappears.
+            self.path = None
+            raise
+
+
+def ec_wait(fd, bit, value):
+    deadline = time.monotonic() + EC_TIMEOUT
+    while True:
+        buf = os.pread(fd, 1, EC_SC)
+        if len(buf) != 1:
+            raise OSError("Short read from EC status register")
+        if ((buf[0] >> bit) & 0x1) == value:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"EC timeout waiting for status bit {bit}={value}")
+        time.sleep(EC_POLL_INTERVAL)
 
 
 def ec_write(fd, port, value):
-    if not ec_wait(fd, IBF, 0):
-        return False
-    os.pwrite(fd, bytes([WR_EC]), EC_SC)
-    if not ec_wait(fd, IBF, 0):
-        return False
-    os.pwrite(fd, bytes([port]), EC_DATA)
-    if not ec_wait(fd, IBF, 0):
-        return False
-    os.pwrite(fd, bytes([value]), EC_DATA)
-    return True
+    for address, byte in ((EC_SC, WR_EC), (EC_DATA, port), (EC_DATA, value)):
+        ec_wait(fd, IBF, 0)
+        if os.pwrite(fd, bytes([byte]), address) != 1:
+            raise OSError(f"Short write to EC port {address:#x}")
+    # Do not cache a mode until the EC has consumed the final data byte.
+    ec_wait(fd, IBF, 0)
 
 
-def set_mode(fd, mode, temp):
-    global _mode
-    if not ec_write(fd, EXTREME_COOLING_REGISTER, mode):
-        log(f"EC write timeout — failed to set {MODE_NAMES[mode]}")
-        return False
-    _mode = mode
-    log(f"Fan {MODE_NAMES[mode]} (temp={temp}°C)")
-    return True
+def choose_mode(mode, temp, thresholds):
+    """Choose a mode using hysteresis; None temperature means sensor failure."""
+    if temp is None or temp >= thresholds.temp_on:
+        return MODE_EXTREME
+    if mode == MODE_EXTREME and temp > thresholds.temp_off:
+        return MODE_EXTREME
+    if temp <= thresholds.temp_normal_off:
+        return MODE_OFF
+    if mode in (MODE_NORMAL, MODE_EXTREME) or temp >= thresholds.temp_normal_on:
+        return MODE_NORMAL
+    return MODE_OFF
 
 
-def cleanup_pid():
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+class FanController:
+    def __init__(self, fd):
+        self.fd = fd
+        # Unknown at startup: explicitly apply the first selected mode.
+        self.mode = None
+        self.write_failed = False
 
-
-def handle_signal(signum, frame):
-    global _shutdown
-    sig_name = signal.Signals(signum).name
-    log(f"Received {sig_name}, shutting down...")
-    _shutdown = True
-
-
-def write_pid():
-    try:
-        with open(PID_FILE, "x") as f:
-            f.write(str(os.getpid()))
-    except FileExistsError:
+    def set_mode(self, mode, reason):
+        if mode == self.mode and not self.write_failed:
+            return True
         try:
-            with open(PID_FILE, "r") as f:
-                old_pid = f.read().strip()
-            os.kill(int(old_pid), 0)
-            log(f"Another instance is already running (PID {old_pid})")
-            sys.exit(1)
-        except (ProcessLookupError, ValueError, PermissionError):
-            with open(PID_FILE, "w") as f:
-                f.write(str(os.getpid()))
-    atexit.register(cleanup_pid)
+            ec_write(self.fd, EXTREME_COOLING_REGISTER, mode)
+        except OSError as e:
+            # A partial transaction may have changed the hardware. Reapply the
+            # next selection even if it matches the last successful mode.
+            self.write_failed = True
+            log(f"EC communication error setting {MODE_NAMES[mode]}: {e}")
+            return False
+        self.mode = mode
+        self.write_failed = False
+        log(f"Fan {MODE_NAMES[mode]} ({reason})")
+        return True
+
+    def stop(self):
+        if not self.set_mode(MODE_OFF, "shutdown"):
+            log("Could not reset fan mode before exit")
 
 
-def main():
-    global _port_fd, _temp_fd, _mode
+@contextmanager
+def single_instance(path=PID_FILE):
+    # Keep this file in place: unlinking a locked file permits two processes
+    # to lock different inodes. The kernel releases the lock even after a crash.
+    with open(path, "a+", encoding="ascii") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise RuntimeError("Another auto_ec instance is already running") from e
+        f.seek(0)
+        f.truncate()
+        f.write(str(os.getpid()))
+        f.flush()
+        yield
 
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Lenovo Extreme Cooling Automation")
     parser.add_argument("--temp-on", type=int, default=DEFAULT_TEMP_ON,
                         help=f"Temperature threshold to activate extreme cooling (default: {DEFAULT_TEMP_ON})")
@@ -140,79 +166,136 @@ def main():
                         help=f"Temperature threshold to turn fans off (default: {DEFAULT_TEMP_NORMAL_OFF})")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
                         help=f"Temperature check interval in seconds (default: {DEFAULT_INTERVAL})")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not (args.temp_normal_off < args.temp_normal_on <= args.temp_off < args.temp_on):
+        parser.error("thresholds must satisfy: --temp-normal-off < --temp-normal-on "
+                     "<= --temp-off < --temp-on")
+    if args.interval <= 0:
+        parser.error("--interval must be greater than zero")
+    return args
 
-    # Hysteresis: 10°C gap between on/off prevents rapid toggling
-    # when temperature fluctuates around the threshold.
-    if args.temp_off >= args.temp_on:
-        log("--temp-off must be less than --temp-on")
-        sys.exit(1)
-    if args.temp_normal_off >= args.temp_normal_on:
-        log("--temp-normal-off must be less than --temp-normal-on")
-        sys.exit(1)
-    if args.temp_normal_on >= args.temp_on:
-        log("--temp-normal-on must be less than --temp-on")
-        sys.exit(1)
 
-    write_pid()
+class StopSignal:
+    """Wake a poll from SIGINT/SIGTERM via a non-blocking pipe."""
 
-    temp_path = get_cpu_temp_path()
-    if not temp_path:
-        log("CPU temperature sensor (k10temp) not found")
-        sys.exit(1)
+    def __init__(self):
+        self._flag = threading.Event()
+        self._read, self._write = os.pipe()
+        os.set_blocking(self._read, False)
+        os.set_blocking(self._write, False)
 
-    if not os.access("/dev/port", os.R_OK | os.W_OK):
-        log("No read/write access to /dev/port — run as root")
-        sys.exit(1)
+    def install_wakeup(self):
+        return signal.set_wakeup_fd(self._write)
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    def close(self):
+        for fd in (self._read, self._write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._read = self._write = None
 
-    _port_fd = os.open("/dev/port", os.O_RDWR)
-    _temp_fd = os.open(temp_path, os.O_RDONLY)
+    def set(self):
+        self._flag.set()
 
-    log(f"Started: extreme={args.temp_on}/{args.temp_off}°C "
-        f"normal={args.temp_normal_on}/{args.temp_normal_off}°C "
-        f"interval={args.interval}s")
+    def is_set(self):
+        return self._flag.is_set()
 
+    def wait(self, timeout):
+        if self._flag.is_set():
+            return True
+        readable, _, _ = select.select([self._read], [], [], timeout)
+        if readable:
+            try:
+                while os.read(self._read, 256):
+                    pass
+            except (BlockingIOError, OSError):
+                pass
+        return self._flag.is_set()
+
+
+def _log_sensor_failure(message, last_fail_log):
+    now = time.monotonic()
+    if last_fail_log is not None and now - last_fail_log < FAIL_LOG_INTERVAL:
+        return last_fail_log
+    log(message)
+    return now
+
+
+def control_loop(fans, sensor, args, shutdown):
+    seen_sample = False
+    sensor_failed = False
+    last_fail_log = None
+    while not shutdown.is_set():
+        try:
+            temp = sensor.read()
+        except (OSError, ValueError) as e:
+            if not seen_sample:
+                last_fail_log = _log_sensor_failure(
+                    f"Temperature sensor unavailable: {e}; waiting", last_fail_log)
+                shutdown.wait(args.interval)
+                continue
+            last_fail_log = _log_sensor_failure(
+                f"Temperature read failed: {e}; requesting EXTREME cooling",
+                last_fail_log)
+            sensor_failed = True
+            temp = None
+        else:
+            if sensor_failed:
+                log(f"Temperature sensor recovered (temp={temp:g}°C)")
+            seen_sample = True
+            sensor_failed = False
+            last_fail_log = None
+
+        mode = choose_mode(fans.mode, temp, args)
+        reason = "sensor unavailable" if temp is None else f"temp={temp:g}°C"
+        fans.set_mode(mode, reason)
+        shutdown.wait(args.interval)
+
+
+def run(args):
+    shutdown = StopSignal()
+
+    def handle_signal(signum, frame):
+        shutdown.set()
+
+    previous_handlers = {}
+    previous_wakeup = None
     try:
-        _mode = MODE_OFF
-        while not _shutdown:
-            try:
-                raw = os.pread(_temp_fd, 16, 0)
-                if isinstance(raw, bytes):
-                    raw = raw.decode("ascii", errors="ignore").strip()
-                temp = int(raw) / 1000
-            except (OSError, ValueError, AttributeError):
-                temp = 0
-                log(f"Failed to read temperature from {temp_path}")
+        previous_wakeup = shutdown.install_wakeup()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, handle_signal)
 
-            try:
-                if temp >= args.temp_on and _mode != MODE_EXTREME:
-                    set_mode(_port_fd, MODE_EXTREME, temp)
-                elif _mode == MODE_EXTREME and temp <= args.temp_off:
-                    next_mode = MODE_NORMAL if temp >= args.temp_normal_on else MODE_OFF
-                    set_mode(_port_fd, next_mode, temp)
-                elif temp >= args.temp_normal_on and _mode == MODE_OFF:
-                    set_mode(_port_fd, MODE_NORMAL, temp)
-                elif temp <= args.temp_normal_off and _mode == MODE_NORMAL:
-                    set_mode(_port_fd, MODE_OFF, temp)
-            except (OSError, IndexError) as e:
-                log(f"EC communication error: {e}")
+        with single_instance(), ExitStack() as resources:
+            sensor = TemperatureSensor()
+            fd = os.open("/dev/port", os.O_RDWR)
+            resources.callback(os.close, fd)
+            fans = FanController(fd)
+            resources.callback(fans.stop)
 
-            time.sleep(args.interval)
+            sensor_name = sensor.path if sensor.path is not None else "pending"
+            log(f"Started: extreme={args.temp_on}/{args.temp_off}°C "
+                f"normal={args.temp_normal_on}/{args.temp_normal_off}°C "
+                f"interval={args.interval}s sensor={sensor_name}")
+            control_loop(fans, sensor, args, shutdown)
     finally:
-        if _mode != MODE_OFF:
-            log("Deactivating fans before exit...")
-            if ec_write(_port_fd, EXTREME_COOLING_REGISTER, MODE_OFF):
-                _mode = MODE_OFF
-                log("Fans deactivated")
-            else:
-                log("EC write timeout — fans may still be active")
-        os.close(_temp_fd)
-        os.close(_port_fd)
-        log("Stopped")
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if previous_wakeup is not None:
+            signal.set_wakeup_fd(previous_wakeup)
+        shutdown.close()
+    log("Stopped")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        run(args)
+    except (OSError, RuntimeError) as e:
+        log(f"Cannot run cooling controller: {e}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

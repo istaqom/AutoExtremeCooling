@@ -20,10 +20,14 @@ sudo cp auto_ec.py /usr/local/bin/auto_ec.py
 sudo chmod 755 /usr/local/bin/auto_ec.py
 ```
 
-You can modify `auto_ec.py` before copying it (or edit `/usr/local/bin/auto_ec.py` later), especially:
-- `TEMP_ON` / `TEMP_OFF` to tune when Extreme Cooling (`0x40`) turns on/off.
-- `TEMP_NORMAL_ON` / `TEMP_NORMAL_OFF` to tune when normal fan (`0x80`) turns on/off.
-- `INTERVAL` to tune how often temperature checks run.
+Configure the command-line flags in `lenovo-ec.service` before installing it:
+- `--temp-on` / `--temp-off`: enter/leave Extreme Cooling (defaults: 70/60°C).
+- `--temp-normal-on` / `--temp-normal-off`: enter normal mode/turn fans off (defaults: 50/40°C).
+- `--interval`: seconds between temperature checks (default: 5; must be positive).
+
+Thresholds must satisfy `temp-normal-off < temp-normal-on <= temp-off < temp-on`.
+Normal mode stays active until `temp-normal-off`, including when stepping down
+from Extreme Cooling. This hysteresis prevents switching on every small fluctuation.
 
 ## 2) Install and start the systemd service
 
@@ -33,6 +37,48 @@ Copy `lenovo-ec.service` to `/etc/systemd/system/`, then reload and enable it:
 sudo cp lenovo-ec.service /etc/systemd/system/lenovo-ec.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now lenovo-ec.service
+```
+
+After updating an existing installation, repeat the copy commands, then run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart lenovo-ec.service
+```
+
+## Behavior and troubleshooting
+
+- The first temperature sample explicitly sets a fan mode, even when it selects OFF.
+- A missing sensor at startup waits and does not command the EC. The wait is
+  logged immediately and then once a minute until a reading arrives.
+- If temperature reads fail after a good sample, the controller requests EXTREME
+  cooling and rediscovers the sensor on subsequent checks. That failure is logged
+  immediately and then once a minute. Normal hysteresis resumes when readings recover.
+- Failed EC writes are logged and retried on the next temperature check. A successful
+  write means the EC consumed the command; it does not verify physical fan speed.
+- SIGINT/SIGTERM wake the controller immediately; shutdown attempts to set OFF.
+- A kernel lock prevents concurrent instances. `/run/auto_ec.pid` stays in place,
+  but its lock is released automatically when the process exits.
+
+View recent mode changes and errors:
+
+```bash
+journalctl -u lenovo-ec.service -n 100 --no-pager
+```
+
+Repeated NORMAL/OFF changes at 50°C/40°C match the default thresholds: the CPU
+warms while fans are off, then cools while they run. Lowering `--temp-normal-off`
+keeps normal mode active longer. Repeated EC errors or fans disagreeing with logged
+modes need further diagnosis; this script tracks the last successfully written mode
+and does not read back the register or fan RPM.
+
+## Development checks
+
+The regression tests use simulated EC I/O and temporary sensor files:
+
+```bash
+python3 -m unittest discover -s tests -v
+systemd-analyze verify lenovo-ec.service
 ```
 
 ## Compatibility notes
